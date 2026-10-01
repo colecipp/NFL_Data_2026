@@ -618,19 +618,15 @@ qb_stats["TWP_Pctl"] = np.nan
 # These should eventually total 1.00.
 
 QB_WEIGHTS = {
-    "QBR_Pctl": 0.00,
-    "EPA_DB_Pctl": 0.00,
-    "CPOE_Pctl": 0.00,
-    "Success_Rate_Pctl": 0.00,
-    "TWP_Pctl": 0.00,
-    "Sack_Rate_Pctl": 0.00,
-    "On_Target_Pctl": 0.00,
-
-    # Scramble EPA + scramble success are combined
-    # into ONE scramble score below.
-    "Scramble_Pctl": 0.00,
-
-    "Rush_EPA_Pctl": 0.00
+    "QBR_Pctl": 0.16,
+    "EPA_DB_Pctl": 0.18,
+    "CPOE_Pctl": 0.12,
+    "Success_Rate_Pctl": 0.10,
+    "TWP_Pctl": 0.16,
+    "Sack_Rate_Pctl": 0.10,
+    "On_Target_Pctl": 0.08,
+    "Scramble_Pctl": 0.05,
+    "Rush_EPA_Pctl": 0.05
 }
 
 
@@ -705,36 +701,313 @@ qb_stats["Advanced_Rating"] = (
 
 
 # ==================================================
-# LEGACY MADDEN / PFF / PFR DATA
+# LOAD LEGACY DATABASE RATINGS
 # ==================================================
 
-# Eventually these will be merged automatically from
-# your existing player database.
-#
-# For now these columns are blank so you can manually
-# enter/test values if desired.
+LEGACY_DB_FILE = "2026_NFLActive.xlsx"
 
-qb_stats["Madden"] = np.nan
-qb_stats["PFF"] = np.nan
-qb_stats["PFR"] = np.nan
+legacy = pd.read_excel(
+    LEGACY_DB_FILE,
+    sheet_name="Main"
+)
+
+# We only need these fields from the old database.
+# Pandas will call the SECOND duplicate Madden column "Madden.1",
+# so "Madden" correctly refers to Column G.
+legacy = legacy[
+    [
+        "Team",
+        "Pos",
+        "Player",
+        "Age",
+        "Madden",
+        "PFF",
+        "PFR"
+    ]
+].copy()
+
+
+# ==================================================
+# NORMALIZE PLAYER NAMES FOR MATCHING
+# ==================================================
+
+import re
+import unicodedata
+
+
+def normalize_player_name(name):
+
+    if pd.isna(name):
+        return ""
+
+    name = str(name)
+
+    # Remove accents
+    name = unicodedata.normalize(
+        "NFKD",
+        name
+    ).encode(
+        "ascii",
+        "ignore"
+    ).decode()
+
+    # Lowercase
+    name = name.lower()
+
+    # Remove punctuation
+    name = re.sub(
+        r"[^a-z0-9 ]",
+        "",
+        name
+    )
+
+    # Remove common suffixes
+    suffixes = {
+        "jr",
+        "sr",
+        "ii",
+        "iii",
+        "iv"
+    }
+
+    parts = [
+        part
+        for part in name.split()
+        if part not in suffixes
+    ]
+
+    return " ".join(parts)
+
+
+legacy["Name_Key"] = (
+    legacy["Player"]
+    .apply(normalize_player_name)
+)
+
+legacy["Pos_Key"] = (
+    legacy["Pos"]
+    .astype(str)
+    .str.upper()
+    .str.strip()
+)
+
+legacy["Team_Key"] = (
+    legacy["Team"]
+    .astype(str)
+    .str.upper()
+    .str.strip()
+)
+
+
+qb_stats["Name_Key"] = (
+    qb_stats["Player"]
+    .apply(normalize_player_name)
+)
+
+qb_stats["Pos_Key"] = "QB"
+
+qb_stats["Team_Key"] = (
+    qb_stats["Team_2025"]
+    .astype(str)
+    .str.upper()
+    .str.strip()
+)
+
+
+# ==================================================
+# PRIMARY MATCH
+# NAME + POSITION + 2025 TEAM
+# ==================================================
+
+legacy_primary = (
+    legacy
+    .drop_duplicates(
+        [
+            "Name_Key",
+            "Pos_Key",
+            "Team_Key"
+        ],
+        keep=False
+    )
+    [
+        [
+            "Name_Key",
+            "Pos_Key",
+            "Team_Key",
+            "Age",
+            "Madden",
+            "PFF",
+            "PFR"
+        ]
+    ]
+)
+
+
+qb_stats = qb_stats.merge(
+    legacy_primary,
+    on=[
+        "Name_Key",
+        "Pos_Key",
+        "Team_Key"
+    ],
+    how="left"
+)
+
+
+qb_stats["Legacy_Match_Status"] = np.where(
+    qb_stats["Madden"].notna(),
+    "NAME+POS+TEAM",
+    "UNMATCHED"
+)
+
+
+# ==================================================
+# FALLBACK MATCH
+# NAME + POSITION ONLY
+# ==================================================
+
+# Only allow fallback if that player/position combination
+# appears exactly ONCE in the old database.
+
+name_pos_counts = (
+    legacy
+    .groupby(
+        [
+            "Name_Key",
+            "Pos_Key"
+        ]
+    )
+    .size()
+    .reset_index(
+        name="Match_Count"
+    )
+)
+
+
+legacy_fallback = legacy.merge(
+    name_pos_counts,
+    on=[
+        "Name_Key",
+        "Pos_Key"
+    ],
+    how="left"
+)
+
+
+legacy_fallback = legacy_fallback[
+    legacy_fallback["Match_Count"] == 1
+][
+    [
+        "Name_Key",
+        "Pos_Key",
+        "Age",
+        "Madden",
+        "PFF",
+        "PFR"
+    ]
+].copy()
+
+
+legacy_fallback = legacy_fallback.rename(
+    columns={
+        "Age": "Fallback_Age",
+        "Madden": "Fallback_Madden",
+        "PFF": "Fallback_PFF",
+        "PFR": "Fallback_PFR"
+    }
+)
+
+
+qb_stats = qb_stats.merge(
+    legacy_fallback,
+    on=[
+        "Name_Key",
+        "Pos_Key"
+    ],
+    how="left"
+)
+
+
+needs_fallback = (
+    qb_stats["Madden"].isna()
+)
+
+
+qb_stats.loc[
+    needs_fallback,
+    "Age"
+] = qb_stats.loc[
+    needs_fallback,
+    "Fallback_Age"
+]
+
+
+qb_stats.loc[
+    needs_fallback,
+    "Madden"
+] = qb_stats.loc[
+    needs_fallback,
+    "Fallback_Madden"
+]
+
+
+qb_stats.loc[
+    needs_fallback,
+    "PFF"
+] = qb_stats.loc[
+    needs_fallback,
+    "Fallback_PFF"
+]
+
+
+qb_stats.loc[
+    needs_fallback,
+    "PFR"
+] = qb_stats.loc[
+    needs_fallback,
+    "Fallback_PFR"
+]
+
+
+fallback_success = (
+    needs_fallback &
+    qb_stats["Fallback_Madden"].notna()
+)
+
+
+qb_stats.loc[
+    fallback_success,
+    "Legacy_Match_Status"
+] = "NAME+POS"
+
+
+# ==================================================
+# CLEAN TEMPORARY MATCHING COLUMNS
+# ==================================================
+
+qb_stats = qb_stats.drop(
+    columns=[
+        "Name_Key",
+        "Pos_Key",
+        "Team_Key",
+        "Fallback_Age",
+        "Fallback_Madden",
+        "Fallback_PFF",
+        "Fallback_PFR"
+    ],
+    errors="ignore"
+)
 
 
 # ==================================================
 # LEGACY RATING
 # ==================================================
 
-# Your existing formula:
-#
-# Madden * .5722
-# + PFF * 1.1 * .3611
-# + PFR * 5.2 * .0666
-
 qb_stats["Legacy_Rating"] = (
     qb_stats["Madden"] * 0.5722 +
     qb_stats["PFF"] * 1.1 * 0.3611 +
     qb_stats["PFR"] * 5.2 * 0.0666
 )
-
 
 # ==================================================
 # FINAL OVERALL WEIGHTS
@@ -743,13 +1016,21 @@ qb_stats["Legacy_Rating"] = (
 # EDIT THESE while testing.
 # They should total 1.00.
 
-ADVANCED_OVR_WEIGHT = 0.00
-LEGACY_OVR_WEIGHT = 0.00
+ADVANCED_OVR_WEIGHT = 0.60
+LEGACY_OVR_WEIGHT = 0.40
 
 
 qb_stats["Final_Overall"] = (
     qb_stats["Advanced_Rating"] * ADVANCED_OVR_WEIGHT +
     qb_stats["Legacy_Rating"] * LEGACY_OVR_WEIGHT
+)
+
+qb_stats["Age_Adjusted_Overall"] = (
+    qb_stats["Final_Overall"] *
+    (
+        (100 + (29 - qb_stats["Age"])) /
+        100
+    )
 )
 
 # ==================================================
@@ -763,14 +1044,20 @@ qb_output = qb_stats[
         "Player",
         "Team_2025",
         "Position",
+        "Age",
+        "Dropbacks",
+        "Legacy_Rating",
+        "Final_Overall",
+        "Age_Adjusted_Overall",
+        "Advanced_Weighted_Pctl",
+        "Advanced_Rating",
 
+        "Legacy_Match_Status",
         "pfr_id",
         "pff_id",
         "espn_id",
-
-        "Dropbacks",
+        
         "Passing_Pct_Eligible",
-
         "QBR",
         "QBR_Pctl",
 
@@ -809,15 +1096,10 @@ qb_output = qb_stats[
         "Designed_Rush_EPA_per_Attempt",
         "Rush_EPA_Pctl",
 
-        "Advanced_Weighted_Pctl",
-        "Advanced_Rating",
-
         "Madden",
         "PFF",
-        "PFR",
-        "Legacy_Rating",
+        "PFR"
 
-        "Final_Overall"
     ]
 ].copy()
 
@@ -868,7 +1150,8 @@ qb_output = qb_output.round(
         "PFR": 1,
         "Legacy_Rating": 2,
 
-        "Final_Overall": 2
+        "Final_Overall": 2,
+        "Age_Adjusted_Overall": 2
     }
 )
 
